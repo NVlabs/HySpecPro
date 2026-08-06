@@ -19,20 +19,15 @@ import torch
 import numpy as np
 from helper import read_hgr
 
-import dgl.function as fn
-import random
-import os
-import random, math, argparse
+import os, argparse
 import cma
-
 import cupy as cp
-import torch
 from torch.utils.dlpack import to_dlpack, from_dlpack
 from cupyx.scipy.sparse import coo_matrix
 from cupyx.scipy.sparse.linalg import eigsh
 
 # batch size dictionary
-design_dict = {
+batch_size_dict = {
     "ibm01": 13000,
     "ibm02": 10000,
     "ibm03": 7000,
@@ -72,13 +67,18 @@ design_dict = {
     "LU_Network": 360,
     "sparcT1_chip2": 300,
     "directrf": 240,
-    "bitcoin_miner": 240
+    "bitcoin_miner": 240,
+    "Bump_2911.mtx": 180,
+    "CurlCurl_4.mtx": 200,
+    "Ga41As41H72.mtx": 200,
+    "Geo_1438.mtx": 250,
+    "HV15R.mtx": 130,
+    "StocF-1465.mtx": 200,
+    "circuit5M.mtx": 100,
+    "dgreen.mtx": 300
 }
-UB = 0.02
-KWAY = 2
-BIPARTITE_EMBED = True
-design_root = "./benchmark/Titan23_benchmark/"
-result_root = "./results/"
+
+PARTITION_DTYPE = torch.uint8
 
 # build bipartite Laplacian from dgl graph
 def bipartite_L_from_dgl(g, etype=('cell', 'connect', 'net'), device="cuda:0", symmetric=False):
@@ -161,9 +161,8 @@ def bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=
     # Return cupy eigenvalues and torch embeddings for cells
     return eigvals_cp, eigvecs_cells_torch
 
-
 # main function to run the partitioner
-def run_partitioner(design, device, tag):
+def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KWAY, UB):
 
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -178,13 +177,12 @@ def run_partitioner(design, device, tag):
         "score_file": result_root + tag + "_" + design + "_best_score.pt",
         "device": device,
         "use_weight": False,
-        "N_batch": design_dict[design],
+        "N_batch": batch_size_dict[design],
         "K": KWAY,
         "e": UB
     }
 
     hgr_file = config["hgr_file"]
-    solution_file = config["solution_file"]
     use_weight = config["use_weight"]
     N_batch = config["N_batch"]
     K = config["K"]
@@ -212,15 +210,16 @@ def run_partitioner(design, device, tag):
             g['connect'].update_all(fn.copy_u('assign_b', 'm'), fn.sum('m', 'net_sum1'), etype='connect')
             net_sum1 = g.nodes["net"].data["net_sum1"].to(torch.float32)
 
-            # Prepare per-net degrees broadcast to [net_cnt, B] (cache by B)
-            deg_b = g.nodes["net"].data.get("deg_b", None)
-            if (deg_b is None) or (deg_b.shape[1] != B):
+            # Cache per-net degree as [net_cnt, 1] and rely on broadcasting.
+            # This avoids materializing a large [net_cnt, B] tensor on L_HG cases.
+            deg_col = g.nodes["net"].data.get("deg_col", None)
+            if deg_col is None:
                 deg = g.in_degrees(torch.arange(g.num_nodes('net'), device=device), etype='connect').to(torch.float32)
-                deg_b = deg.view(-1, 1).repeat(1, B)
-                g.nodes["net"].data["deg_b"] = deg_b
+                deg_col = deg.view(-1, 1)
+                g.nodes["net"].data["deg_col"] = deg_col
 
             # A net is cut if it has at least one pin in both parts
-            net_cut = (net_sum1 > 0.0) & (net_sum1 < deg_b)
+            net_cut = (net_sum1 > 0.0) & (net_sum1 < deg_col)
             N_cut = net_cut.sum(dim=0).to(torch.float32)
 
             # Balance penalty
@@ -245,7 +244,7 @@ def run_partitioner(design, device, tag):
         best_score_list = []
 
         # conduct 5 runs of CMA-ES for each embedding
-        for _ in range(5):
+        for _ in range(N_CMA_ITE):
             for embed_idx, embed in enumerate(embed_list):
                 print("embed_idx: ", embed_idx)
                 # conduct CMA-ES
@@ -275,14 +274,20 @@ def run_partitioner(design, device, tag):
                         temp_score_list = []
                         for s in range(Ns):
                             assign_W_torch_s = assign_W_torch[N_batch * Np * s : N_batch * Np * (s+1)]
-                            logits = torch.einsum('ne,paek->pank', embed, assign_W_torch_s) # N_batch, Na, N_nodes, 2
-                            # logits = RELU(logits)
-                            logits = logits.sum(dim=1) # N_batch, N_nodes, 2
-
-                            # logits = embed @ assign_W_torch_s  # N_batch, N_nodes, 1
-                            logits = logits.permute(1, 0, 2)
-                            # logits = torch.cat((logits,  - logits), 2) # N_nodes, N_batch, 2
-                            solution = torch.argmax(logits, 2)
+                            if K == 2:
+                                # Binary case: argmax([x^T w0, x^T w1]) is
+                                # equivalent to x^T(w1-w0) > 0.  This avoids
+                                # materializing logits with shape [N, B, 2].
+                                w_delta = (assign_W_torch_s[..., 1] - assign_W_torch_s[..., 0]).sum(dim=1)
+                                logits_delta = embed @ w_delta.T
+                                solution = (logits_delta > 0).to(PARTITION_DTYPE)
+                                del w_delta, logits_delta
+                            else:
+                                logits = torch.einsum('ne,paek->pank', embed, assign_W_torch_s)
+                                logits = logits.sum(dim=1)
+                                logits = logits.permute(1, 0, 2)
+                                solution = torch.argmax(logits, 2).to(PARTITION_DTYPE)
+                                del logits
                             score = evaluation(g, solution)
                             temp_score_list.append(score.detach())
 
@@ -295,7 +300,7 @@ def run_partitioner(design, device, tag):
                                 best_solution[:,mask] = solution[:,mask].detach()
                                 del mask
 
-                            del logits, solution, score, assign_W_torch_s
+                            del solution, score, assign_W_torch_s
 
                         temp_score_list = torch.cat(temp_score_list, 0).cpu().tolist()
                         # print("temp_score_list: ", len(temp_score_list))
@@ -333,7 +338,7 @@ def run_partitioner(design, device, tag):
         - assign_batch: LongTensor [cell_cnt, B] of {0,1}
         Returns: (refined_assign_batch [cell_cnt, B], improved_mask [B])
         """
-        assign_batch = assign_batch.long()
+        assign_batch = assign_batch.to(dtype=PARTITION_DTYPE)
         device_local = assign_batch.device
         cell_cnt = g.num_nodes('cell')
         B = assign_batch.shape[1]
@@ -351,7 +356,7 @@ def run_partitioner(design, device, tag):
         def compute_gains_batched(assign_b):
             # Build one-hot per head: [cell_cnt, B, 2]
             onehot = torch.zeros(cell_cnt, B, 2, device=device_local, dtype=torch.float32)
-            onehot.scatter_(2, assign_b.unsqueeze(2), 1.0)
+            onehot.scatter_(2, assign_b.long().unsqueeze(2), 1.0)
             g.nodes['cell'].data['part_onehot_b'] = onehot
             g['connect'].update_all(fn.copy_u('part_onehot_b','m'), fn.sum('m','net_counts_b'), etype='connect')
             net_counts = g.nodes['net'].data['net_counts_b']  # [net_cnt, B, 2]
@@ -429,79 +434,41 @@ def run_partitioner(design, device, tag):
 
         return assign_batch, improved_any
 
-    # reduce graph by removing large nets
-    print("Analyzing net degrees...")
-    with torch.no_grad():
-        D = g.in_degrees(torch.arange(net_cnt, device=device), etype='connect')
-        max_degree = D.max().item()
-        print(f"Max net degree: {max_degree}")
-
-        top_percent_value = torch.quantile(D.float(), 0.9999)
-        print(f"Top 0.01% net degree: {top_percent_value.item()}")
-
-        degree_threshold = max(120, min(200, top_percent_value.item()))
-        mask = D >= degree_threshold
-        n_large_nets = mask.sum().item()
-        print(f"Removing {n_large_nets} large nets (degree >= {degree_threshold})")
-
-    if n_large_nets > 0:
-        ori_g = g.to("cpu")
-        ori_cell_cnt = ori_g.num_nodes('cell')
-        remove_net_idx = torch.nonzero(mask, as_tuple=True)[0]
-        edges = g.in_edges(remove_net_idx, etype='connect')
-        remove_eids = g.edge_ids(edges[0], edges[1], etype="connect")
-        g = dgl.remove_edges(g, remove_eids, "connect")
-        g = dgl.remove_nodes(g, remove_net_idx, "net")
-        assert g.num_nodes('cell') == ori_cell_cnt, \
-            f"Cell count changed! Original: {ori_cell_cnt}, After: {g.num_nodes('cell')}"
-        del mask, edges, remove_eids, D, remove_net_idx
-        torch.cuda.empty_cache()
-        new_g_flag = True
-        print(f"Graph reduced: {ori_g.num_nodes('net')} -> {g.num_nodes('net')} nets")
-        print(f"Cell count unchanged: {g.num_nodes('cell')} cells")
-    else:
-        # with torch.no_grad():
-        #     D_after = g.in_degrees(torch.arange(g.num_nodes('net'), device=device), etype='connect').float()
-        #     g.nodes["net"].data["deg"] = D_after.view(-1,1).repeat(1, N_batch)
-        new_g_flag = False
-
     # construct embedding spaces
     embed_list = []
-
-    if BIPARTITE_EMBED:
-        # Compute spectral embedding from bipartite graph
-        k = 48
-        eigvals, eigvecs_cells_torch = bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=k, which='SA', device=device)
-        print("Bipartite graph eigvals:", eigvals)
-        mask = eigvals > 1e-6
-        eigvals = eigvals[mask]
-        eigvecs_cells_torch = eigvecs_cells_torch[:, mask]
-        embed_list += [eigvecs_cells_torch[:, :4], eigvecs_cells_torch[:, :8], eigvecs_cells_torch[:, :16], eigvecs_cells_torch[:, :24], eigvecs_cells_torch[:, :36]]
-
-    if new_g_flag:
-        g = ori_g.to(device)
-        new_g_flag = False
+    # Compute spectral embedding from bipartite graph
+    k = 48
+    eigvals, eigvecs_cells_torch = bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=k, which='SA', device=device)
+    print("Bipartite graph eigvals:", eigvals)
+    mask = eigvals > 1e-6
+    eigvals = eigvals[mask]
+    eigvecs_cells_torch = eigvecs_cells_torch[:, mask]
+    embed_list += [eigvecs_cells_torch[:, :4], eigvecs_cells_torch[:, :8], eigvecs_cells_torch[:, :16], eigvecs_cells_torch[:, :24], eigvecs_cells_torch[:, :36]]
 
     best_solution, best_score = CMA_ES_iterations(g, embed_list)
     print("Best score after CMA-ES on all embedding spaces: ", best_score.min())
 
-    if new_g_flag:
-        print("Restoring original graph for final evaluation...")
-        g = ori_g.to(device)
-        best_score = evaluation(g, best_solution)
-        scores_sorted, indices = torch.sort(best_score)
-        best_solution = best_solution[:, indices]
-        best_score = scores_sorted
-        print(f"Final score on original graph: {best_score.min()}")
-    else:
-        scores_sorted, indices = torch.sort(best_score)
-        best_solution = best_solution[:, indices]
-        best_score = scores_sorted
+    scores_sorted, indices = torch.sort(best_score)
+    best_solution = best_solution[:, indices]
+    best_score = scores_sorted
 
-    # FM/KL refinement on the best discrete solutions
+    # FM/KL refinement on the best discrete solutions.
+    total_edge_degree = int(g.num_edges(etype='connect'))
     topK = 32
+    if total_edge_degree >= 100_000_000:
+        topK = 2
+    elif total_edge_degree >= 50_000_000:
+        topK = 8
+
+    print(f"FM/KL topK: {topK} (total_edge_degree={total_edge_degree})")
     best_assign = best_solution[:,:topK].to(device)
-    refined_assign, did_improve = fm_kl_refine_batch(g, best_assign, th_l, th_u, max_passes=10)
+    try:
+        refined_assign, did_improve = fm_kl_refine_batch(g, best_assign, th_l, th_u, max_passes=10)
+    except torch.cuda.OutOfMemoryError as oom:
+        print(f"FM/KL refinement skipped due to CUDA OOM: {oom}")
+        torch.cuda.empty_cache()
+        refined_assign = best_assign
+        did_improve = torch.zeros(topK, dtype=torch.bool, device=device)
     if did_improve.sum() > 0:
         print("FM/KL refinement improved the solution. Re-evaluating...")
         best_solution[:,:topK] = refined_assign.to(best_solution.device)
@@ -511,23 +478,23 @@ def run_partitioner(design, device, tag):
         scores_sorted, indices = torch.sort(best_score)
         best_solution = best_solution[:, indices]
 
-    torch.save(best_solution[:,0].to("cpu"), solution_file)
+    torch.save(best_solution[:,0].to("cpu"), config["solution_file"])
+    torch.save(best_score.min().detach().cpu(), config["score_file"])
     return best_score.min().item()
 
 def main():
     parser = argparse.ArgumentParser(description="HySpecPro")
+    parser.add_argument("--design_root", type=str, default="./benchmark/Titan23_benchmark/", help="Root path to the hgr files")
     parser.add_argument("--design", type=str, default="sparcT1_core", help="Design name")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
-    parser.add_argument("--tag", type=str, default="expected_cut_v2_fmrefine_v1", help="Tag to differentiate different runs")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--tag", type=str, default="v1", help="Tag to differentiate different runs")
+    parser.add_argument("--result_root", type=str, default="./results/", help="Root path to the results")
+    parser.add_argument("--N_CMA_ITE", type=int, default=5, help="Number of CMA-ES iterations")
+    parser.add_argument("--KWAY", type=int, default=2, help="Number of partitions")
+    parser.add_argument("--UB", type=float, default=0.02, help="Upper bound for the partition size")
     args = parser.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-
-    best_score = run_partitioner(args.design, args.device, args.tag)
+    best_score = run_partitioner(args.design_root, args.design, args.device, args.tag, args.result_root, args.N_CMA_ITE, args.KWAY, args.UB)
     print(f"Final best score: {best_score}")
 
 if __name__ == "__main__":

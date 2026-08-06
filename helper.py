@@ -14,8 +14,6 @@
 # limitations under the License.
 
 import torch
-from torch.cuda.amp import GradScaler
-import dgl.function as fn
 from itertools import chain
 import dgl
 
@@ -48,12 +46,9 @@ def read_hgr(hgr_file):
     edge_degrees = [len(e) for e in edges]
     cells = torch.tensor(list(chain.from_iterable(edges))) - 1
     nets = torch.arange(num_edges).repeat_interleave(torch.tensor(edge_degrees))
-    #print("Num of cells: ", cells.shape, len(node_weights))
-    #graph = dgl.heterograph({("cell", "connect", "net"): (cells, nets)})
     data_dict = {("cell", "connect", "net"): (cells, nets)}
     num_nodes_dict = {"cell": num_nodes, "net": num_edges}
     graph = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict)
-    #print(graph)
     graph.nodes["cell"].data["weight"] = torch.tensor(node_weights).to(torch.float)
     graph.nodes["net"].data["weight"] = torch.tensor(edge_weights).to(torch.float)
     return graph
