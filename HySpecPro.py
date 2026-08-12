@@ -17,9 +17,11 @@ import dgl
 import dgl.function as fn
 import torch
 import numpy as np
-from helper import read_hgr
+from helper import read_hgr_fast as read_hgr
+from cut_eval import CutEvaluator
 
 import os, argparse
+import time
 import cma
 import cupy as cp
 from torch.utils.dlpack import to_dlpack, from_dlpack
@@ -188,7 +190,9 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     K = config["K"]
     e = config["e"]
 
+    t_io0 = time.perf_counter()
     g = read_hgr(hgr_file)
+    print(f"HGR IO (fast): {time.perf_counter() - t_io0:.3f}s")
     cell_cnt, net_cnt = g.num_nodes("cell"), g.num_nodes("net")
     print(g)
     g = g.to(device)
@@ -198,10 +202,21 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     th_u = W*(1/K + e)
     print("Partition size constraints: ", th_l, th_u)
 
+    # Bit-packed CUDA evaluator for unweighted 2-way (L_HG / Titan23 default path).
+    # Falls back to DGL float32 message passing for weighted / K-way cases.
+    cut_evaluator = None
+    if K == 2 and not use_weight:
+        t_ev0 = time.perf_counter()
+        cut_evaluator = CutEvaluator(g, device, th_l, th_u)
+        print(f"CutEvaluator init (CSR+JIT): {time.perf_counter() - t_ev0:.3f}s")
+
     # batch evaluation function
     def evaluation(g, population):
         cell_cnt, B = population.shape
         with torch.no_grad():
+            if cut_evaluator is not None:
+                return cut_evaluator(population)
+
             # Use float32 0/1 assignments for efficient DGL message passing
             assign_b = population.to(device=device, dtype=torch.float32)
             g.nodes["cell"].data["assign_b"] = assign_b
@@ -354,7 +369,11 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
         improved_any = torch.zeros(B, dtype=torch.bool, device=device_local)
 
         def compute_gains_batched(assign_b):
-            # Build one-hot per head: [cell_cnt, B, 2]
+            # Fast path: uint8 CSR CUDA kernel (same CutEvaluator CSR as cut eval).
+            if cut_evaluator is not None:
+                return cut_evaluator.compute_gains(assign_b)
+
+            # Fallback: DGL float32 one-hot message passing
             onehot = torch.zeros(cell_cnt, B, 2, device=device_local, dtype=torch.float32)
             onehot.scatter_(2, assign_b.long().unsqueeze(2), 1.0)
             g.nodes['cell'].data['part_onehot_b'] = onehot
