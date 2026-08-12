@@ -1,4 +1,4 @@
-# HySpecPro
+# HySpecPro: Scalable Hypergraph Partitioning via Spectral Projection Optimization
 <img width="299" height="234" alt="image" src="https://github.com/user-attachments/assets/655c7581-f4b2-4eed-950c-d00a7087bfa9" />
 
 
@@ -82,3 +82,7 @@ N_CMA_ITE=5 \
 DEVICES_OVERRIDE="cuda:0 cuda:1 cuda:2 cuda:3" \
 ./run_titan23.sh
 ```
+
+## Other versions
+
+A faster version is available in the fast branch
