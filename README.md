@@ -1,4 +1,5 @@
 # HySpecPro
+<img width="299" height="234" alt="image" src="https://github.com/user-attachments/assets/655c7581-f4b2-4eed-950c-d00a7087bfa9" />
 
 
 HySpecPro is a GPU-accelerated single-level hypergraph partitioner based on
