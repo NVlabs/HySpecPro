@@ -30,31 +30,13 @@ from cupyx.scipy.sparse.linalg import eigsh
 
 # batch size dictionary
 batch_size_dict = {
-    "ibm01": 13000,
-    "ibm02": 10000,
-    "ibm03": 7000,
-    "ibm04": 6000,
-    "ibm05": 5000,
-    "ibm06": 5000,
-    "ibm07": 4000,
-    "ibm08": 3500,
-    "ibm09": 3500,
-    "ibm10": 2600,
-    "ibm11": 2200,
-    "ibm12": 2000,
-    "ibm13": 1500,
-    "ibm14": 1200,
-    "ibm15": 1000,
-    "ibm16": 900,
-    "ibm17": 900,
-    "ibm18": 800,
-    "sparcT1_core": 1860,
-    "neuron": 1700,
-    "stereo_vision": 1700,
-    "des90": 1300,
-    "SLAM_spheric": 1200,
-    "cholesky_mc": 1300,
-    "segmentation": 1060,
+    "sparcT1_core": 1000,
+    "neuron": 1000,
+    "stereo_vision": 1000,
+    "des90": 1000,
+    "SLAM_spheric": 1000,
+    "cholesky_mc": 1000,
+    "segmentation": 1000,
     "bitonic_mesh": 760,
     "dart": 760,
     "openCV": 660,
@@ -68,8 +50,8 @@ batch_size_dict = {
     "LU230": 380,
     "LU_Network": 360,
     "sparcT1_chip2": 300,
-    "directrf": 240,
-    "bitcoin_miner": 240,
+    "directrf": 300,
+    "bitcoin_miner": 300,
     "Bump_2911.mtx": 180,
     "CurlCurl_4.mtx": 200,
     "Ga41As41H72.mtx": 200,
@@ -164,7 +146,18 @@ def bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=
     return eigvals_cp, eigvecs_cells_torch
 
 # main function to run the partitioner
-def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KWAY, UB):
+def run_partitioner(
+    design_root,
+    design,
+    device,
+    tag,
+    result_root,
+    N_CMA_ITE,
+    KWAY,
+    UB,
+    seq_topm=128,
+    seq_passes=6,
+):
 
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -346,123 +339,175 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
         best_score_all = torch.cat(best_score_list, 0)
         return best_solution_all, best_score_all
 
-    # conduct batched FM/KL refinement
-    def fm_kl_refine_batch(g, assign_batch, th_l, th_u, max_passes=2, max_iters=1000):
+    def compute_gains_batched(assign_b):
+        """FM gains for [cell_cnt, B] assignments (used by sequence refine)."""
+        cell_cnt_local = assign_b.shape[0]
+        B_local = assign_b.shape[1]
+        device_local = assign_b.device
+        if cut_evaluator is not None:
+            return cut_evaluator.compute_gains(assign_b)
+
+        onehot = torch.zeros(cell_cnt_local, B_local, 2, device=device_local, dtype=torch.float32)
+        onehot.scatter_(2, assign_b.long().unsqueeze(2), 1.0)
+        g.nodes['cell'].data['part_onehot_b'] = onehot
+        g['connect'].update_all(
+            fn.copy_u('part_onehot_b', 'm'),
+            fn.sum('m', 'net_counts_b'),
+            etype='connect',
+        )
+        net_counts = g.nodes['net'].data['net_counts_b']
+        net_cut = (net_counts[:, :, 0] > 0) & (net_counts[:, :, 1] > 0)
+        pos0 = (net_cut & (net_counts[:, :, 0] == 1)).to(torch.float32)
+        neg0 = ((~net_cut) & (net_counts[:, :, 1] == 0)).to(torch.float32)
+        pos1 = (net_cut & (net_counts[:, :, 1] == 1)).to(torch.float32)
+        neg1 = ((~net_cut) & (net_counts[:, :, 0] == 0)).to(torch.float32)
+        cells_idx, nets_idx = g.in_edges(
+            torch.arange(g.num_nodes('net'), device=device_local), etype='connect'
+        )
+        gain0 = torch.zeros(cell_cnt_local, B_local, device=device_local, dtype=torch.float32)
+        gain1 = torch.zeros(cell_cnt_local, B_local, device=device_local, dtype=torch.float32)
+        gain0.index_add_(0, cells_idx, pos0[nets_idx] - neg0[nets_idx])
+        gain1.index_add_(0, cells_idx, pos1[nets_idx] - neg1[nets_idx])
+        return torch.where(assign_b == 0, gain0, gain1)
+
+    def cut_critical_mask_batched(assign_b):
+        if cut_evaluator is not None:
+            return cut_evaluator.cut_critical_mask(assign_b)
+        return torch.ones_like(assign_b, dtype=torch.bool)
+
+    def criticality_score_batched(assign_b):
+        if cut_evaluator is not None:
+            return cut_evaluator.criticality_score(assign_b)
+        return torch.zeros(
+            assign_b.shape[0], assign_b.shape[1], device=assign_b.device, dtype=torch.float32
+        )
+
+    def sequence_refine_batch(
+        g,
+        assign_batch,
+        th_l,
+        th_u,
+        max_passes=6,
+        top_m=128,
+        refresh_every=8,
+    ):
         """
-        Batched FM/KL refinement.
-        - assign_batch: LongTensor [cell_cnt, B] of {0,1}
-        Returns: (refined_assign_batch [cell_cnt, B], improved_mask [B])
+        HyperG-inspired sequence multi-move refinement (independent reimpl.):
+          1) Prefer cut-critical cells (iHyperG) among positive-gain moves.
+          2) Build a gain-descending move sequence (tie-break by criticality).
+          3) Walk the sequence with periodically refreshed gains under balance.
+          4) Apply the best balanced prefix; accept only if true cut improves.
         """
         assign_batch = assign_batch.to(dtype=PARTITION_DTYPE)
         device_local = assign_batch.device
         cell_cnt = g.num_nodes('cell')
         B = assign_batch.shape[1]
+        top_m = int(min(top_m, cell_cnt))
 
-        # Baseline scores per head
         with torch.no_grad():
-            baseline_scores = evaluation(g, assign_batch)
-        baseline_cut = baseline_scores.to(device_local).float()  # [B]
-
-        part0_sizes = (assign_batch == 0).sum(dim=0).float()  # [B]
-        part1_sizes = (cell_cnt - part0_sizes)
-
+            baseline_cut = evaluation(g, assign_batch).to(device_local).float()
+        part0_sizes = (assign_batch == 0).sum(dim=0).float()
         improved_any = torch.zeros(B, dtype=torch.bool, device=device_local)
+        cols = torch.arange(B, device=device_local)
 
-        def compute_gains_batched(assign_b):
-            # Fast path: uint8 CSR CUDA kernel (same CutEvaluator CSR as cut eval).
-            if cut_evaluator is not None:
-                return cut_evaluator.compute_gains(assign_b)
-
-            # Fallback: DGL float32 one-hot message passing
-            onehot = torch.zeros(cell_cnt, B, 2, device=device_local, dtype=torch.float32)
-            onehot.scatter_(2, assign_b.long().unsqueeze(2), 1.0)
-            g.nodes['cell'].data['part_onehot_b'] = onehot
-            g['connect'].update_all(fn.copy_u('part_onehot_b','m'), fn.sum('m','net_counts_b'), etype='connect')
-            net_counts = g.nodes['net'].data['net_counts_b']  # [net_cnt, B, 2]
-            net_cut = (net_counts[:,:,0] > 0) & (net_counts[:,:,1] > 0)  # [net_cnt, B]
-            pos0 = (net_cut & (net_counts[:,:,0] == 1)).to(torch.float32)
-            neg0 = ((~net_cut) & (net_counts[:,:,1] == 0)).to(torch.float32)
-            pos1 = (net_cut & (net_counts[:,:,1] == 1)).to(torch.float32)
-            neg1 = ((~net_cut) & (net_counts[:,:,0] == 0)).to(torch.float32)
-
-            cells_idx, nets_idx = g.in_edges(torch.arange(g.num_nodes('net'), device=device_local), etype='connect')
-            # edge contributions [E,B]
-            edge_c_pos0 = pos0[nets_idx, :]
-            edge_c_neg0 = neg0[nets_idx, :]
-            edge_c_pos1 = pos1[nets_idx, :]
-            edge_c_neg1 = neg1[nets_idx, :]
-
-            gain0 = torch.zeros(cell_cnt, B, device=device_local, dtype=torch.float32)
-            gain1 = torch.zeros(cell_cnt, B, device=device_local, dtype=torch.float32)
-            gain0.index_add_(0, cells_idx, (edge_c_pos0 - edge_c_neg0))
-            gain1.index_add_(0, cells_idx, (edge_c_pos1 - edge_c_neg1))
-            gains = torch.where(assign_b == 0, gain0, gain1)
-            return gains
+        if cut_evaluator is not None and getattr(cut_evaluator, "_skewed", False):
+            top_m = min(top_m, 64)
+            refresh_every = max(refresh_every, 16)
 
         for _pass in range(max_passes):
-            moved = torch.zeros(cell_cnt, B, dtype=torch.bool, device=device_local)
-            iters = 0
-            while iters < max_iters:
-                gains = compute_gains_batched(assign_batch)
-                gains_masked = gains.masked_fill(moved, float('-inf'))
-                best_gain, best_idx = torch.max(gains_masked, dim=0)  # [B]
-                try_mask = best_gain > 0
-                if not try_mask.any():
-                    break
+            gains = compute_gains_batched(assign_batch)
+            crit = cut_critical_mask_batched(assign_batch)
+            crit_score = criticality_score_batched(assign_batch)
 
-                cols = torch.arange(B, device=device_local)
-                cur_part = assign_batch[best_idx, cols]
+            # Prefer cut-critical / high criticality, but keep all +gain cells.
+            rank = gains + 1e3 * crit.float() + 1e-3 * crit_score
+            rank = rank.masked_fill(gains <= 0, float('-inf'))
 
-                # Balance check per head
-                new_p0 = torch.where(cur_part == 0, part0_sizes - 1, part0_sizes + 1)
-                new_p1 = cell_cnt - new_p0
-                balance_ok = (new_p0 >= th_l) & (new_p0 <= th_u) & (new_p1 >= th_l) & (new_p1 <= th_u)
-                cand_mask = try_mask & balance_ok
-                if not cand_mask.any():
-                    # mark tried as moved and continue
-                    moved[best_idx[try_mask], cols[try_mask]] = True
-                    iters += 1
+            top_vals, top_idx = torch.topk(rank, k=top_m, dim=0)
+            working = assign_batch.clone()
+            w_p0 = part0_sizes.clone()
+            accepted_rows = [[] for _ in range(B)]
+            accepted_gains = [[] for _ in range(B)]
+            live_gains = gains.clone()
+
+            for step in range(top_m):
+                if step > 0 and (step % refresh_every == 0):
+                    live_gains = compute_gains_batched(working)
+
+                rows = top_idx[step]
+                step_gain = live_gains[rows, cols]
+                cur_part = working[rows, cols]
+                new_p0 = torch.where(cur_part == 0, w_p0 - 1.0, w_p0 + 1.0)
+                new_p1 = float(cell_cnt) - new_p0
+                bal_ok = (new_p0 >= th_l) & (new_p0 <= th_u) & (new_p1 >= th_l) & (new_p1 <= th_u)
+                take = (step_gain > 0) & bal_ok & (top_vals[step] > float('-inf'))
+                if not take.any():
                     continue
 
-                # Tentatively flip all candidate heads in a copy and evaluate in one shot
-                tentative = assign_batch.clone()
-                flip_cols = cols[cand_mask]
-                flip_rows = best_idx[cand_mask]
-                tentative[flip_rows, flip_cols] = 1 - cur_part[cand_mask]
+                t_rows = rows[take]
+                t_cols = cols[take]
+                working[t_rows, t_cols] = 1 - cur_part[take]
+                delta = torch.where(cur_part[take] == 0, -1.0, 1.0)
+                w_p0[take] = w_p0[take] + delta
 
-                with torch.no_grad():
-                    new_scores = evaluation(g, tentative).to(device_local).float()
+                for b in take.nonzero(as_tuple=False).flatten().tolist():
+                    accepted_rows[b].append(int(rows[b].item()))
+                    accepted_gains[b].append(float(step_gain[b].item()))
 
-                accept_mask = cand_mask & (new_scores < baseline_cut)
-                if accept_mask.any():
-                    a_cols = cols[accept_mask]
-                    a_rows = best_idx[accept_mask]
-                    assign_batch[a_rows, a_cols] = 1 - assign_batch[a_rows, a_cols]
-                    # update baselines and sizes for accepted
-                    improved_any[accept_mask] = True
-                    delta = torch.where(cur_part[accept_mask] == 0, -1.0, 1.0)
-                    part0_sizes[accept_mask] = part0_sizes[accept_mask] + delta
-                    part1_sizes[accept_mask] = cell_cnt - part0_sizes[accept_mask]
-                    baseline_cut[accept_mask] = new_scores[accept_mask]
-                    moved[a_rows, a_cols] = True
-                else:
-                    # None accepted; mark tried as moved to avoid reselecting
-                    moved[best_idx[cand_mask], cols[cand_mask]] = True
+            tentative = assign_batch.clone()
+            any_move = False
+            for b in range(B):
+                rows_b = accepted_rows[b]
+                gains_b = accepted_gains[b]
+                if not rows_b:
+                    continue
+                cum = 0.0
+                best_j = -1
+                best_cum = 0.0
+                for j, gv in enumerate(gains_b):
+                    cum += gv
+                    if cum > best_cum:
+                        best_cum = cum
+                        best_j = j
+                if best_j < 0:
+                    continue
+                for j in range(best_j + 1):
+                    tentative[rows_b[j], b] = 1 - assign_batch[rows_b[j], b]
+                any_move = True
 
-                iters += 1
+            if not any_move:
+                break
+
+            with torch.no_grad():
+                new_scores = evaluation(g, tentative).to(device_local).float()
+            accept = new_scores < baseline_cut
+            if not accept.any():
+                break
+
+            assign_batch[:, accept] = tentative[:, accept]
+            baseline_cut[accept] = new_scores[accept]
+            part0_sizes[accept] = (assign_batch[:, accept] == 0).sum(dim=0).float()
+            improved_any[accept] = True
 
         return assign_batch, improved_any
 
     # construct embedding spaces
     embed_list = []
-    # Compute spectral embedding from bipartite graph
     k = 48
-    eigvals, eigvecs_cells_torch = bipartite_spectral_embeddings_from_dgl(g, etype=('cell','connect','net'), k=k, which='SA', device=device)
+    eigvals, eigvecs_cells_torch = bipartite_spectral_embeddings_from_dgl(
+        g, etype=('cell', 'connect', 'net'), k=k, which='SA', device=device
+    )
     print("Bipartite graph eigvals:", eigvals)
     mask = eigvals > 1e-6
     eigvals = eigvals[mask]
     eigvecs_cells_torch = eigvecs_cells_torch[:, mask]
-    embed_list += [eigvecs_cells_torch[:, :4], eigvecs_cells_torch[:, :8], eigvecs_cells_torch[:, :16], eigvecs_cells_torch[:, :24], eigvecs_cells_torch[:, :36]]
+    embed_list += [
+        eigvecs_cells_torch[:, :4],
+        eigvecs_cells_torch[:, :8],
+        eigvecs_cells_torch[:, :16],
+        eigvecs_cells_torch[:, :24],
+        eigvecs_cells_torch[:, :36],
+    ]
 
     best_solution, best_score = CMA_ES_iterations(g, embed_list)
     print("Best score after CMA-ES on all embedding spaces: ", best_score.min())
@@ -471,7 +516,6 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     best_solution = best_solution[:, indices]
     best_score = scores_sorted
 
-    # FM/KL refinement on the best discrete solutions.
     total_edge_degree = int(g.num_edges(etype='connect'))
     topK = 32
     if total_edge_degree >= 100_000_000:
@@ -479,30 +523,45 @@ def run_partitioner(design_root, design, device, tag, result_root, N_CMA_ITE, KW
     elif total_edge_degree >= 50_000_000:
         topK = 8
 
-    print(f"FM/KL topK: {topK} (total_edge_degree={total_edge_degree})")
-    best_assign = best_solution[:,:topK].to(device)
+    print(
+        f"Sequence refine topK={topK} seq_topm={seq_topm} seq_passes={seq_passes} "
+        f"(total_edge_degree={total_edge_degree})"
+    )
+    best_assign = best_solution[:, :topK].to(device)
+    pre_cut = evaluation(g, best_assign)
+    print(f"Pre-refine best cut: {float(pre_cut.min()):.1f}")
     try:
-        refined_assign, did_improve = fm_kl_refine_batch(g, best_assign, th_l, th_u, max_passes=10)
+        t0 = time.perf_counter()
+        refined_assign, did_improve = sequence_refine_batch(
+            g, best_assign, th_l, th_u, max_passes=seq_passes, top_m=seq_topm
+        )
+        print(
+            f"Sequence refine: improved_heads={int(did_improve.sum())} "
+            f"time={time.perf_counter() - t0:.3f}s"
+        )
     except torch.cuda.OutOfMemoryError as oom:
-        print(f"FM/KL refinement skipped due to CUDA OOM: {oom}")
+        print(f"Refinement skipped due to CUDA OOM: {oom}")
         torch.cuda.empty_cache()
         refined_assign = best_assign
         did_improve = torch.zeros(topK, dtype=torch.bool, device=device)
-    if did_improve.sum() > 0:
-        print("FM/KL refinement improved the solution. Re-evaluating...")
-        best_solution[:,:topK] = refined_assign.to(best_solution.device)
-        best_score[:topK] = evaluation(g, best_solution[:,:topK])
-        print(f"Refined final score: {best_score.min(), best_score[0]}")
 
-        scores_sorted, indices = torch.sort(best_score)
-        best_solution = best_solution[:, indices]
+    best_solution[:, :topK] = refined_assign.to(best_solution.device)
+    best_score[:topK] = evaluation(g, best_solution[:, :topK])
+    print(
+        f"Post-refine best cut: {float(best_score.min()):.1f} "
+        f"(improved_heads={int(did_improve.sum())})"
+    )
+    scores_sorted, indices = torch.sort(best_score)
+    best_solution = best_solution[:, indices]
+    best_score = scores_sorted
 
-    torch.save(best_solution[:,0].to("cpu"), config["solution_file"])
+    torch.save(best_solution[:, 0].to("cpu"), config["solution_file"])
     torch.save(best_score.min().detach().cpu(), config["score_file"])
     return best_score.min().item()
 
+
 def main():
-    parser = argparse.ArgumentParser(description="HySpecPro")
+    parser = argparse.ArgumentParser(description="HySpecPro (sequence local search)")
     parser.add_argument("--design_root", type=str, default="./benchmark/Titan23_benchmark/", help="Root path to the hgr files")
     parser.add_argument("--design", type=str, default="sparcT1_core", help="Design name")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
@@ -511,10 +570,24 @@ def main():
     parser.add_argument("--N_CMA_ITE", type=int, default=5, help="Number of CMA-ES iterations")
     parser.add_argument("--KWAY", type=int, default=2, help="Number of partitions")
     parser.add_argument("--UB", type=float, default=0.02, help="Upper bound for the partition size")
+    parser.add_argument("--seq_topm", type=int, default=128, help="Max move-sequence length per pass")
+    parser.add_argument("--seq_passes", type=int, default=6, help="Sequence refine passes")
     args = parser.parse_args()
 
-    best_score = run_partitioner(args.design_root, args.design, args.device, args.tag, args.result_root, args.N_CMA_ITE, args.KWAY, args.UB)
+    best_score = run_partitioner(
+        args.design_root,
+        args.design,
+        args.device,
+        args.tag,
+        args.result_root,
+        args.N_CMA_ITE,
+        args.KWAY,
+        args.UB,
+        seq_topm=args.seq_topm,
+        seq_passes=args.seq_passes,
+    )
     print(f"Final best score: {best_score}")
+
 
 if __name__ == "__main__":
     main()
