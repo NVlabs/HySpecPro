@@ -85,4 +85,6 @@ DEVICES_OVERRIDE="cuda:0 cuda:1 cuda:2 cuda:3" \
 
 ## Other versions
 
-A faster version is available in the fast branch
+```
+The main branch is primarily intended for research prototyping and uses a relatively simple implementation. The fast branch delivers similar performance while running several times faster, thanks to a more optimized implementation.
+```
