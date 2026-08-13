@@ -226,3 +226,65 @@ class CutEvaluator:
                 self.high_net_ids,
             )
         return gains
+
+    def _net_part_counts(self, assign):
+        """sum1[net, b] = #pins in part 1 for assignment [cell_cnt, B]."""
+        assign = assign.to(device=self.device, dtype=torch.uint8)
+        B = assign.shape[1]
+        pin_assign = assign[self.cell_idx].to(torch.int32)
+        sum1 = torch.zeros(self.net_cnt, B, device=self.device, dtype=torch.int32)
+        sum1.index_add_(0, self.net_ids_coo, pin_assign)
+        return sum1
+
+    def cut_critical_mask(self, population):
+        """
+        Boolean mask [cell_cnt, B]: True if cell is cut-critical on ≥1 cut net.
+
+        A vertex v is cut-critical to hyperedge e if it is the only pin of e in
+        its current part (moving v can reduce connectivity). Inspired by the
+        publicly described cut-critical focusing in iHyperG (DAC'26, CC BY 4.0).
+        """
+        assign = population.to(device=self.device, dtype=torch.uint8).contiguous()
+        sum1 = self._net_part_counts(assign)
+        deg = self.deg.unsqueeze(1)
+        cut = (sum1 > 0) & (sum1 < deg)
+        crit_net0 = cut & (sum1 == (deg - 1))  # unique part-0 pin
+        crit_net1 = cut & (sum1 == 1)          # unique part-1 pin
+        pin_assign = assign[self.cell_idx]  # [E, B]
+        edge_crit = torch.where(
+            pin_assign == 0,
+            crit_net0[self.net_ids_coo],
+            crit_net1[self.net_ids_coo],
+        ).to(torch.float32)
+        crit = torch.zeros(
+            self.cell_cnt, assign.shape[1], device=self.device, dtype=torch.float32
+        )
+        crit.index_add_(0, self.cell_idx.to(torch.int64), edge_crit)
+        return crit > 0
+
+    def criticality_score(self, population):
+        """
+        s(v) = c(v) - n(v) = 2*c(v) - deg(v), where c(v) is #incident nets on
+        which v is cut-critical and n(v) is the rest. Higher ⇒ better move
+        candidate when rebalancing / refining (iHyperG-style priority).
+        Returns float32 [cell_cnt, B].
+        """
+        assign = population.to(device=self.device, dtype=torch.uint8).contiguous()
+        sum1 = self._net_part_counts(assign)
+        deg = self.deg.unsqueeze(1)
+        cut = (sum1 > 0) & (sum1 < deg)
+        crit_net0 = cut & (sum1 == (deg - 1))
+        crit_net1 = cut & (sum1 == 1)
+        pin_assign = assign[self.cell_idx]
+        edge_crit = torch.where(
+            pin_assign == 0,
+            crit_net0[self.net_ids_coo],
+            crit_net1[self.net_ids_coo],
+        ).to(torch.float32)
+        c = torch.zeros(
+            self.cell_cnt, assign.shape[1], device=self.device, dtype=torch.float32
+        )
+        c.index_add_(0, self.cell_idx.to(torch.int64), edge_crit)
+        # cell degree from CSR-by-cell
+        cell_deg = (self.cell_ptr[1:] - self.cell_ptr[:-1]).to(torch.float32).unsqueeze(1)
+        return 2.0 * c - cell_deg
